@@ -30,6 +30,7 @@
 #define IDM_FORMAT_FONT         40031
 
 #define IDM_VIEW_STATUS_BAR     40040
+#define IDM_VIEW_FONT           40041
 
 #define IDM_THEME_LIGHT         40060
 #define IDM_THEME_DARK          40061

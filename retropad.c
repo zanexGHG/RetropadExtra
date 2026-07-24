@@ -785,9 +785,6 @@ static void UpdateMenuStates(HWND hwnd) {
     }
 
     CheckMenuRadioItem(menu, IDM_THEME_LIGHT, IDM_THEME_CUSTOM, IDM_THEME_LIGHT + g_app.theme, MF_BYCOMMAND);
-
-    BOOL modified = (SendMessageW(g_app.hwndEdit, EM_GETMODIFY, 0, 0) != 0);
-    EnableMenuItem(menu, IDM_FILE_SAVE, MF_BYCOMMAND | (modified ? MF_ENABLED : MF_GRAYED));
 }
 
 static void HandleCommand(HWND hwnd, WPARAM wParam, LPARAM lParam) {
@@ -859,6 +856,9 @@ static void HandleCommand(HWND hwnd, WPARAM wParam, LPARAM lParam) {
 
     case IDM_VIEW_STATUS_BAR:
         ToggleStatusBar(hwnd, !g_app.statusVisible);
+        break;
+    case IDM_VIEW_FONT:
+        DoSelectFont(hwnd);
         break;
 
     case IDM_THEME_LIGHT:
