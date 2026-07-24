@@ -10,7 +10,7 @@ BEGIN
         MENUITEM "&New\tCtrl+N",            IDM_FILE_NEW
         MENUITEM "&Open...\tCtrl+O",        IDM_FILE_OPEN
         MENUITEM "&Save\tCtrl+S",           IDM_FILE_SAVE
-        MENUITEM "Save &As...",             IDM_FILE_SAVE_AS
+        MENUITEM "Save &As...\tCtrl+Shift+S", IDM_FILE_SAVE_AS
         MENUITEM SEPARATOR
         MENUITEM "Page Set&up...",          IDM_FILE_PAGE_SETUP
         MENUITEM "&Print...\tCtrl+P",       IDM_FILE_PRINT
@@ -62,6 +62,7 @@ BEGIN
     "^N",       IDM_FILE_NEW,       VIRTKEY, CONTROL
     "^O",       IDM_FILE_OPEN,      VIRTKEY, CONTROL
     "^S",       IDM_FILE_SAVE,      VIRTKEY, CONTROL
+    "S",        IDM_FILE_SAVE_AS,   VIRTKEY, CONTROL, SHIFT
     "^P",       IDM_FILE_PRINT,     VIRTKEY, CONTROL
     "^Z",       IDM_EDIT_UNDO,      VIRTKEY, CONTROL
     "^X",       IDM_EDIT_CUT,       VIRTKEY, CONTROL
