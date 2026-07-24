@@ -8,7 +8,7 @@ RC=rc
 
 CFLAGS=/nologo /DUNICODE /D_UNICODE /W4 /EHsc
 LDFLAGS=/nologo
-LIBS=user32.lib gdi32.lib comdlg32.lib comctl32.lib shell32.lib
+LIBS=user32.lib gdi32.lib comdlg32.lib comctl32.lib shell32.lib dwmapi.lib uxtheme.lib
 
 OBJS=retropad.obj file_io.obj retropad.res
 

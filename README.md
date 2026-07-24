@@ -1,4 +1,6 @@
-# retropad
+﻿# retropad
+
+A fork of retropad that adds a few features I personally would like to have. (Dont roast my code, I'm not that good in C and I'm VERY tired xD)
 
 A Petzold-style Win32 Notepad clone written in mostly plain C. It keeps the classic menus, accelerators, word wrap toggle, status bar, find/replace, font picker, time/date insertion, and BOM-aware load/save. Printing is intentionally omitted.
 

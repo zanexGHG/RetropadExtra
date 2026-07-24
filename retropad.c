@@ -6,6 +6,9 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <strsafe.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
+#include <stdlib.h>
 #include "resource.h"
 #include "file_io.h"
 
@@ -15,11 +18,30 @@
 #define DEFAULT_WIDTH  640
 #define DEFAULT_HEIGHT 480
 
+typedef struct Theme {
+    COLORREF fg;
+    COLORREF bg;
+    COLORREF statusBg;
+    COLORREF statusText;
+} Theme;
+
+#define THEME_CUSTOM 2
+
+static const Theme g_themes[] = {
+    { RGB(0, 0, 0),       RGB(255, 255, 255), RGB(240, 240, 240), RGB(0, 0, 0)       },
+    { RGB(220, 220, 220), RGB(30, 30, 30),    RGB(45, 45, 48),    RGB(220, 220, 220) },
+};
+
 typedef struct AppState {
     HWND hwndMain;
     HWND hwndEdit;
     HWND hwndStatus;
     HFONT hFont;
+    int theme;
+    Theme colors;
+    Theme custom;
+    HBRUSH hThemeBrush;
+    WCHAR statusText[128];
     WCHAR currentPath[MAX_PATH_BUFFER];
     BOOL wordWrap;
     BOOL statusVisible;
@@ -38,6 +60,67 @@ static AppState g_app = {0};
 static HINSTANCE g_hInst = NULL;
 static UINT g_findMsg = 0;
 
+typedef enum { APPMODE_DEFAULT, APPMODE_ALLOWDARK, APPMODE_FORCEDARK, APPMODE_FORCELIGHT, APPMODE_MAX } PreferredAppMode;
+typedef PreferredAppMode (WINAPI *SetPreferredAppModeFn)(PreferredAppMode);
+typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
+typedef void (WINAPI *FlushMenuThemesFn)(void);
+static AllowDarkModeForWindowFn g_allowDarkModeForWindow = NULL;
+static FlushMenuThemesFn g_flushMenuThemes = NULL;
+
+static void InitDarkMode(void) {
+    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    SetPreferredAppModeFn setMode = (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+    g_allowDarkModeForWindow = (AllowDarkModeForWindowFn)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+    g_flushMenuThemes = (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+    if (setMode) setMode(APPMODE_ALLOWDARK);
+}
+
+static BOOL IsDarkColor(COLORREF c) {
+    return (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000 < 128;
+}
+
+static COLORREF Lighten(COLORREF c, int amt) {
+    return RGB(min(255, GetRValue(c) + amt), min(255, GetGValue(c) + amt), min(255, GetBValue(c) + amt));
+}
+
+// Undocumented window messages feature used by Windows to draw themed menu bars and individual menu-bar items. (Thanks to a random stackoverflow post over 12 years ago or smth xD)
+#define WM_UAHDRAWMENU     0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+
+typedef union { DWORD rgsizeBar[4]; DWORD rgsizePopup[8]; } UAHMENUITEMMETRICS;
+typedef struct { DWORD rgcx[4]; DWORD fUpdateMaxWidths : 2; } UAHMENUPOPUPMETRICS;
+typedef struct { HMENU hmenu; HDC hdc; DWORD dwFlags; } UAHMENU;
+typedef struct { int iPosition; UAHMENUITEMMETRICS umim; UAHMENUPOPUPMETRICS umpm; } UAHMENUITEM;
+typedef struct { DRAWITEMSTRUCT dis; UAHMENU um; UAHMENUITEM umi; } UAHDRAWMENUITEM;
+
+static RECT MenuBarRect(HWND hwnd) {
+    MENUBARINFO mbi = { sizeof(mbi) };
+    GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi);
+    RECT rcWin;
+    GetWindowRect(hwnd, &rcWin);
+    RECT rc = mbi.rcBar;
+    OffsetRect(&rc, -rcWin.left, -rcWin.top);
+    return rc;
+}
+
+// Hide the light resize grip in dark mode (cuz it triggers tf out of me to have a little light quare on the bottom right)
+static LRESULT CALLBACK StatusSubclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    (void)id; (void)ref;
+    LRESULT r = DefSubclassProc(h, msg, wp, lp);
+    if (msg == WM_PAINT && IsDarkColor(g_app.colors.bg)) {
+        RECT rc;
+        GetClientRect(h, &rc);
+        rc.left = rc.right - GetSystemMetrics(SM_CXVSCROLL) - 4;
+        HDC hdc = GetDC(h);
+        HBRUSH b = CreateSolidBrush(g_app.colors.statusBg);
+        FillRect(hdc, &rc, b);
+        DeleteObject(b);
+        ReleaseDC(h, hdc);
+    }
+    return r;
+}
+
 static void UpdateTitle(HWND hwnd);
 static void CreateEditControl(HWND hwnd);
 static void UpdateLayout(HWND hwnd);
@@ -53,7 +136,14 @@ static void ShowReplaceDialog(HWND hwnd);
 static BOOL DoFindNext(BOOL reverse);
 static void DoSelectFont(HWND hwnd);
 static void InsertTimeDate(HWND hwnd);
+static void SetTheme(int theme);
+static void ApplyColors(void);
+static void ApplyWindowTheme(void);
+static BOOL PickColor(HWND owner, COLORREF *color);
+static INT_PTR CALLBACK CustomizeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam);
 static void HandleFindReplace(LPFINDREPLACE lpfr);
+static void LoadSettings(void);
+static void SaveSettings(void);
 static BOOL LoadDocumentFromPath(HWND hwnd, LPCWSTR path);
 static INT_PTR CALLBACK GoToDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK AboutDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -240,11 +330,12 @@ static void CreateEditControl(HWND hwnd) {
         style |= WS_HSCROLL | ES_AUTOHSCROLL;
     }
 
-    g_app.hwndEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, style, 0, 0, 0, 0, hwnd, (HMENU)1, g_hInst, NULL);
+    g_app.hwndEdit = CreateWindowExW(0, L"EDIT", NULL, style, 0, 0, 0, 0, hwnd, (HMENU)1, g_hInst, NULL);
     if (g_app.hwndEdit && g_app.hFont) {
         ApplyFontToEdit(g_app.hwndEdit, g_app.hFont);
     }
     SendMessageW(g_app.hwndEdit, EM_SETLIMITTEXT, 0, 0); // allow large files
+    if (g_app.hThemeBrush) ApplyWindowTheme();
     UpdateLayout(hwnd);
 }
 
@@ -252,7 +343,8 @@ static void ToggleStatusBar(HWND hwnd, BOOL visible) {
     g_app.statusVisible = visible;
     if (visible) {
         if (!g_app.hwndStatus) {
-            g_app.hwndStatus = CreateStatusWindowW(WS_CHILD | SBARS_SIZEGRIP, L"", hwnd, 2);
+            g_app.hwndStatus = CreateStatusWindowW(WS_CHILD, L"", hwnd, 2);
+            SetWindowSubclass(g_app.hwndStatus, StatusSubclass, 1, 0);
         }
         ShowWindow(g_app.hwndStatus, SW_SHOW);
     } else if (g_app.hwndStatus) {
@@ -401,9 +493,8 @@ static void UpdateStatusBar(HWND hwnd) {
     int col = (int)(selStart - SendMessageW(g_app.hwndEdit, EM_LINEINDEX, line - 1, 0)) + 1;
     int lines = (int)SendMessageW(g_app.hwndEdit, EM_GETLINECOUNT, 0, 0);
 
-    WCHAR status[128];
-    StringCchPrintfW(status, ARRAYSIZE(status), L"Ln %d, Col %d    Lines: %d", line, col, lines);
-    SendMessageW(g_app.hwndStatus, SB_SETTEXT, 0, (LPARAM)status);
+    StringCchPrintfW(g_app.statusText, ARRAYSIZE(g_app.statusText), L"Ln %d, Col %d    Lines: %d", line, col, lines);
+    SendMessageW(g_app.hwndStatus, SB_SETTEXT, SBT_OWNERDRAW, (LPARAM)g_app.statusText);
 }
 
 static void ShowFindDialog(HWND hwnd) {
@@ -533,6 +624,99 @@ static void InsertTimeDate(HWND hwnd) {
     SendMessageW(g_app.hwndEdit, EM_REPLACESEL, TRUE, (LPARAM)stamp);
 }
 
+static void ApplyWindowTheme(void) {
+    BOOL dark = IsDarkColor(g_app.colors.bg);
+    const WCHAR *sub = dark ? L"DarkMode_Explorer" : L"Explorer";
+    if (g_allowDarkModeForWindow) {
+        g_allowDarkModeForWindow(g_app.hwndMain, dark);
+        if (g_app.hwndEdit) g_allowDarkModeForWindow(g_app.hwndEdit, dark);
+        if (g_app.hwndStatus) g_allowDarkModeForWindow(g_app.hwndStatus, dark);
+    }
+    DwmSetWindowAttribute(g_app.hwndMain, 20, &dark, sizeof(dark));
+    if (g_app.hwndEdit) SetWindowTheme(g_app.hwndEdit, sub, NULL);
+    if (g_app.hwndStatus) SetWindowTheme(g_app.hwndStatus, sub, NULL);
+    if (g_flushMenuThemes) g_flushMenuThemes();
+    DrawMenuBar(g_app.hwndMain);
+}
+
+static void ApplyColors(void) {
+    if (g_app.hThemeBrush) DeleteObject(g_app.hThemeBrush);
+    g_app.hThemeBrush = CreateSolidBrush(g_app.colors.bg);
+    if (g_app.hwndStatus) {
+        SendMessageW(g_app.hwndStatus, SB_SETBKCOLOR, 0, g_app.colors.statusBg);
+        InvalidateRect(g_app.hwndStatus, NULL, TRUE);
+    }
+    ApplyWindowTheme();
+    InvalidateRect(g_app.hwndEdit, NULL, TRUE);
+}
+
+static void SetTheme(int theme) {
+    g_app.theme = theme;
+    g_app.colors = (theme == THEME_CUSTOM) ? g_app.custom : g_themes[theme];
+    ApplyColors();
+}
+
+static BOOL PickColor(HWND owner, COLORREF *color) {
+    static COLORREF custom[16] = {0};
+    CHOOSECOLORW cc = {0};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = owner;
+    cc.rgbResult = *color;
+    cc.lpCustColors = custom;
+    cc.Flags = CC_RGBINIT | CC_FULLOPEN;
+    if (!ChooseColorW(&cc)) return FALSE;
+    *color = cc.rgbResult;
+    return TRUE;
+}
+
+static COLORREF *SwatchColor(Theme *t, int ctrlId) {
+    switch (ctrlId) {
+    case IDC_CUST_TEXT:       return &t->fg;
+    case IDC_CUST_BG:         return &t->bg;
+    case IDC_CUST_STATUSBG:   return &t->statusBg;
+    case IDC_CUST_STATUSTEXT: return &t->statusText;
+    }
+    return NULL;
+}
+
+static INT_PTR CALLBACK CustomizeDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static Theme t;
+    switch (msg) {
+    case WM_INITDIALOG:
+        t = g_app.colors;
+        return TRUE;
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
+        COLORREF *c = SwatchColor(&t, dis->CtlID);
+        if (!c) return FALSE;
+        HBRUSH b = CreateSolidBrush(*c);
+        FillRect(dis->hDC, &dis->rcItem, b);
+        DeleteObject(b);
+        FrameRect(dis->hDC, &dis->rcItem, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDOK:
+            g_app.custom = t;
+            SetTheme(THEME_CUSTOM);
+            EndDialog(dlg, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(dlg, IDCANCEL);
+            return TRUE;
+        default: {
+            COLORREF *c = SwatchColor(&t, LOWORD(wParam));
+            if (c && PickColor(dlg, c)) {
+                InvalidateRect((HWND)lParam, NULL, TRUE);
+            }
+            return TRUE;
+        }
+        }
+    }
+    return FALSE;
+}
+
 static void HandleFindReplace(LPFINDREPLACE lpfr) {
     if (lpfr->Flags & FR_DIALOGTERM) {
         g_app.hFindDlg = NULL;
@@ -599,6 +783,8 @@ static void UpdateMenuStates(HWND hwnd) {
     } else {
         EnableMenuItem(menu, IDM_VIEW_STATUS_BAR, MF_BYCOMMAND | MF_ENABLED);
     }
+
+    CheckMenuRadioItem(menu, IDM_THEME_LIGHT, IDM_THEME_CUSTOM, IDM_THEME_LIGHT + g_app.theme, MF_BYCOMMAND);
 
     BOOL modified = (SendMessageW(g_app.hwndEdit, EM_GETMODIFY, 0, 0) != 0);
     EnableMenuItem(menu, IDM_FILE_SAVE, MF_BYCOMMAND | (modified ? MF_ENABLED : MF_GRAYED));
@@ -675,6 +861,14 @@ static void HandleCommand(HWND hwnd, WPARAM wParam, LPARAM lParam) {
         ToggleStatusBar(hwnd, !g_app.statusVisible);
         break;
 
+    case IDM_THEME_LIGHT:
+    case IDM_THEME_DARK:
+        SetTheme(LOWORD(wParam) - IDM_THEME_LIGHT);
+        break;
+    case IDM_THEME_CUSTOM:
+        DialogBoxW(g_hInst, MAKEINTRESOURCE(IDD_CUSTOMIZE), hwnd, CustomizeDlgProc);
+        break;
+
     case IDM_HELP_VIEW_HELP:
         MessageBoxW(hwnd, L"No help file is available for retropad.", APP_TITLE, MB_ICONINFORMATION);
         break;
@@ -698,6 +892,73 @@ static INT_PTR CALLBACK AboutDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM l
     return FALSE;
 }
 
+static void GetIniPath(WCHAR *out, size_t cch) {
+    GetModuleFileNameW(NULL, out, (DWORD)cch);
+    WCHAR *slash = wcsrchr(out, L'\\');
+    if (slash) StringCchCopyW(slash + 1, cch - (size_t)(slash + 1 - out), L"retropad.ini");
+}
+
+static int IniGetInt(LPCWSTR path, LPCWSTR key, int def) {
+    WCHAR buf[64], defs[32];
+    StringCchPrintfW(defs, ARRAYSIZE(defs), L"%d", def);
+    GetPrivateProfileStringW(L"retropad", key, defs, buf, ARRAYSIZE(buf), path);
+    return _wtoi(buf);
+}
+
+static void IniSetInt(LPCWSTR path, LPCWSTR key, int val) {
+    WCHAR buf[32];
+    StringCchPrintfW(buf, ARRAYSIZE(buf), L"%d", val);
+    WritePrivateProfileStringW(L"retropad", key, buf, path);
+}
+
+static void LoadSettings(void) {
+    WCHAR path[MAX_PATH_BUFFER];
+    GetIniPath(path, ARRAYSIZE(path));
+
+    g_app.theme = IniGetInt(path, L"Theme", 0);
+    if (g_app.theme < 0 || g_app.theme > THEME_CUSTOM) g_app.theme = 0;
+    g_app.custom.fg = (COLORREF)IniGetInt(path, L"CustomFg", (int)g_themes[0].fg);
+    g_app.custom.bg = (COLORREF)IniGetInt(path, L"CustomBg", (int)g_themes[0].bg);
+    g_app.custom.statusBg = (COLORREF)IniGetInt(path, L"CustomStatusBg", (int)g_themes[0].statusBg);
+    g_app.custom.statusText = (COLORREF)IniGetInt(path, L"CustomStatusText", (int)g_themes[0].statusText);
+    g_app.wordWrap = IniGetInt(path, L"WordWrap", 0) != 0;
+    g_app.statusVisible = IniGetInt(path, L"StatusBar", 1) != 0;
+
+    WCHAR face[LF_FACESIZE];
+    GetPrivateProfileStringW(L"retropad", L"FontFace", L"", face, ARRAYSIZE(face), path);
+    if (face[0]) {
+        LOGFONTW lf = {0};
+        lf.lfHeight = IniGetInt(path, L"FontHeight", -12);
+        lf.lfWeight = IniGetInt(path, L"FontWeight", FW_NORMAL);
+        lf.lfItalic = (BYTE)IniGetInt(path, L"FontItalic", 0);
+        lf.lfCharSet = DEFAULT_CHARSET;
+        StringCchCopyW(lf.lfFaceName, LF_FACESIZE, face);
+        g_app.hFont = CreateFontIndirectW(&lf);
+    }
+}
+
+static void SaveSettings(void) {
+    WCHAR path[MAX_PATH_BUFFER];
+    GetIniPath(path, ARRAYSIZE(path));
+
+    IniSetInt(path, L"Theme", g_app.theme);
+    IniSetInt(path, L"CustomFg", (int)g_app.custom.fg);
+    IniSetInt(path, L"CustomBg", (int)g_app.custom.bg);
+    IniSetInt(path, L"CustomStatusBg", (int)g_app.custom.statusBg);
+    IniSetInt(path, L"CustomStatusText", (int)g_app.custom.statusText);
+    IniSetInt(path, L"WordWrap", g_app.wordWrap);
+    IniSetInt(path, L"StatusBar", g_app.statusVisible);
+
+    if (g_app.hFont) {
+        LOGFONTW lf = {0};
+        GetObjectW(g_app.hFont, sizeof(lf), &lf);
+        WritePrivateProfileStringW(L"retropad", L"FontFace", lf.lfFaceName, path);
+        IniSetInt(path, L"FontHeight", lf.lfHeight);
+        IniSetInt(path, L"FontWeight", lf.lfWeight);
+        IniSetInt(path, L"FontItalic", lf.lfItalic);
+    }
+}
+
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == g_findMsg) {
         HandleFindReplace((LPFINDREPLACE)lParam);
@@ -709,7 +970,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
         InitCommonControlsEx(&icc);
         CreateEditControl(hwnd);
-        ToggleStatusBar(hwnd, TRUE);
+        ToggleStatusBar(hwnd, g_app.statusVisible);
+        SetTheme(g_app.theme);
+        if (g_app.wordWrap) {
+            EnableMenuItem(GetMenu(hwnd), IDM_VIEW_STATUS_BAR, MF_BYCOMMAND | MF_GRAYED);
+            EnableMenuItem(GetMenu(hwnd), IDM_EDIT_GOTO, MF_BYCOMMAND | MF_GRAYED);
+        }
         UpdateTitle(hwnd);
         UpdateStatusBar(hwnd);
         DragAcceptFiles(hwnd, TRUE);
@@ -718,6 +984,66 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_SETFOCUS:
         if (g_app.hwndEdit) SetFocus(g_app.hwndEdit);
         return 0;
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wParam, g_app.colors.fg);
+        SetBkColor((HDC)wParam, g_app.colors.bg);
+        return (LRESULT)g_app.hThemeBrush;
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lParam;
+        if (dis->hwndItem != g_app.hwndStatus) break;
+        HBRUSH b = CreateSolidBrush(g_app.colors.statusBg);
+        FillRect(dis->hDC, &dis->rcItem, b);
+        DeleteObject(b);
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, g_app.colors.statusText);
+        RECT rc = dis->rcItem;
+        rc.left += 4;
+        DrawTextW(dis->hDC, (LPCWSTR)dis->itemData, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        return TRUE;
+    }
+    case WM_UAHDRAWMENU: {
+        if (!IsDarkColor(g_app.colors.bg)) break;
+        UAHMENU *pum = (UAHMENU *)lParam;
+        RECT rc = MenuBarRect(hwnd);
+        HBRUSH b = CreateSolidBrush(g_app.colors.statusBg);
+        FillRect(pum->hdc, &rc, b);
+        DeleteObject(b);
+        return TRUE;
+    }
+    case WM_UAHDRAWMENUITEM: {
+        if (!IsDarkColor(g_app.colors.bg)) break;
+        UAHDRAWMENUITEM *pmi = (UAHDRAWMENUITEM *)lParam;
+        WCHAR text[128] = L"";
+        MENUITEMINFOW mii = { sizeof(mii) };
+        mii.fMask = MIIM_STRING;
+        mii.dwTypeData = text;
+        mii.cch = ARRAYSIZE(text) - 1;
+        GetMenuItemInfoW(pmi->um.hmenu, pmi->umi.iPosition, TRUE, &mii);
+
+        BOOL hot = (pmi->dis.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) != 0;
+        HBRUSH b = CreateSolidBrush(hot ? Lighten(g_app.colors.statusBg, 24) : g_app.colors.statusBg);
+        FillRect(pmi->um.hdc, &pmi->dis.rcItem, b);
+        DeleteObject(b);
+        SetBkMode(pmi->um.hdc, TRANSPARENT);
+        SetTextColor(pmi->um.hdc, g_app.colors.statusText);
+        DrawTextW(pmi->um.hdc, text, -1, &pmi->dis.rcItem, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        return TRUE;
+    }
+    case WM_NCACTIVATE:
+    case WM_NCPAINT: {
+        LRESULT r = DefWindowProcW(hwnd, msg, wParam, lParam);
+        if (IsDarkColor(g_app.colors.bg)) {
+            RECT rc = MenuBarRect(hwnd);
+            rc.top = rc.bottom;
+            rc.bottom += 1;
+            HDC hdc = GetWindowDC(hwnd);
+            HBRUSH b = CreateSolidBrush(g_app.colors.statusBg);
+            FillRect(hdc, &rc, b);
+            DeleteObject(b);
+            ReleaseDC(hwnd, hdc);
+        }
+        return r;
+    }
     case WM_SIZE:
         UpdateLayout(hwnd);
         UpdateStatusBar(hwnd);
@@ -754,6 +1080,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         return 0;
     case WM_DESTROY:
+        SaveSettings();
+        if (g_app.hThemeBrush) DeleteObject(g_app.hThemeBrush);
         PostQuitMessage(0);
         return 0;
     }
@@ -766,11 +1094,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
     g_hInst = hInstance;
     g_findMsg = RegisterWindowMessageW(FINDMSGSTRINGW);
+    InitDarkMode();
     g_app.wordWrap = FALSE;
     g_app.statusVisible = TRUE;
-    g_app.statusBeforeWrap = TRUE;
     g_app.encoding = ENC_UTF8;
     g_app.findFlags = FR_DOWN;
+    g_app.theme = 0;
+    g_app.colors = g_themes[0];
+    g_app.custom = g_themes[0];
+    LoadSettings();
+    g_app.statusBeforeWrap = g_app.statusVisible;
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);

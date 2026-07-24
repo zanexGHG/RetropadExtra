@@ -31,6 +31,10 @@
 
 #define IDM_VIEW_STATUS_BAR     40040
 
+#define IDM_THEME_LIGHT         40060
+#define IDM_THEME_DARK          40061
+#define IDM_THEME_CUSTOM        40062
+
 #define IDM_HELP_VIEW_HELP      40050
 #define IDM_HELP_ABOUT          40051
 
@@ -38,4 +42,10 @@
 #define IDD_GOTO                50001
 #define IDD_ABOUT               50002
 #define IDC_GOTO_EDIT           50010
+
+#define IDD_CUSTOMIZE           50003
+#define IDC_CUST_TEXT           50020
+#define IDC_CUST_BG             50021
+#define IDC_CUST_STATUSBG       50022
+#define IDC_CUST_STATUSTEXT     50023
 
